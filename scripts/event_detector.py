@@ -62,13 +62,17 @@ def preprocessing_step(file):
     this_time = f['Acquisition']['Raw[0]']['RawDataTime'][:]
     times = sintela_to_datetime(this_time)
     x = np.linspace(0,data.shape[1],data.shape[1]) * attrs['SpatialSamplingInterval']
-    
+
 
     fs = attrs['PulseRate'] #sample rate
-
+    bp_top = 200
+    bp_bottom = 1
+    downsample_rate = int(fs/bp_top)
     #filter
-    sos = signal.butter(10, 1, 'hp', fs=fs, output='sos')
+    sos = signal.butter(10, [bp_bottom,bp_top], 'bp', fs=fs, output='sos')
     filtered = signal.sosfiltfilt(sos, data, axis=0)
+
+    #normalize
     data_normed_filtered = chan_norm(filtered)
 
     if file[-9:-7] != '00':
@@ -83,16 +87,23 @@ def preprocessing_step(file):
     # this_time = np.arange(0,int(fs*60))* 500 + this_time[0]
     # print(this_time)
 
-
-    filled_data = np.zeros((int(fs*60),data_normed_filtered.shape[1]))
+    filled_data = np.zeros((int(fs*60),data_normed_filtered.shape[0]))
     filled_times = np.zeros((int(fs*60)), dtype=object)
 
 
+
     filled_times[data_locator] = times
-    filled_data[data_locator] = data_normed_filtered
+    filled_data[data_locator] = data_normed_filtered.T
     filt_filled_data = filled_data[:,:]
 
-    return filt_filled_data, filled_times, attrs
+    ## Downsample 
+    filled_times = filled_times[::downsample_rate]
+    filt_filled_data = filt_filled_data[::downsample_rate,::5] #Skip every 5th channel
+    new_dict = dict(attrs)
+    new_dict['PulseRate'] = new_dict['PulseRate']/downsample_rate
+
+
+    return filt_filled_data, filled_times, new_dict
 
 def preprocessing_step_single_channel(file, channel=100):
 
@@ -133,7 +144,7 @@ def preprocessing_step_single_channel(file, channel=100):
 
     filled_times[data_locator] = times
     filled_data[data_locator] = filtered
-    filt_filled_data = filled_data[:]
+    filt_filled_data = filled_data[:, ::5] #take every 5th channel
 
     return filt_filled_data, filled_times, attrs
 
@@ -145,7 +156,9 @@ def foo(a, b):
 
 def chan_norm(das_data):
     data_normed = (das_data - np.mean(das_data, axis=0))/np.std(das_data, axis=0)
-    return data_normed
+    data_normed_all_axis = (data_normed.T - np.mean(data_normed, axis=1))/np.std(data_normed, axis=1).T    
+ 
+    return data_normed_all_axis
 
 class DataStats:
     def __init__(self, data, attrs, times):
@@ -234,6 +247,7 @@ for i in tqdm(range(len(files_list))):
     if files_list[i][-9:-7] != '00' or i == 0:
         try:
             filt_filled_data, times, attrs = preprocessing_step(files_list[i])
+
         except: 
             continue
         
@@ -265,6 +279,6 @@ for i in tqdm(range(len(files_list))):
 
     # if i ==10: break
 
-with open('../auto_picked_events_all.pkl', 'wb') as file:
+with open('../auto_picked_events_all_5thChannel.pkl', 'wb') as file:
     # Serialize and write the data to the file
     pkl.dump(all_trigger_times, file)
