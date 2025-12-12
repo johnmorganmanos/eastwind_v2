@@ -34,6 +34,9 @@ import pyTMD.tools
 import pyTMD.utilities
 import timescale.time
 
+np.float_ = np.float64
+import dascore as dc
+
 def sintela_to_datetime(sintela_times):
     '''
     returns an array of datetime.datetime 
@@ -68,12 +71,23 @@ def preprocessing_step(file):
     bp_top = 200
     bp_bottom = 1
     downsample_rate = int(fs/bp_top)
-    #filter
+
+    #filter by freq
     sos = signal.butter(10, [bp_bottom,bp_top], 'bp', fs=fs, output='sos')
     filtered = signal.sosfiltfilt(sos, data, axis=0)
 
+    #FK filter
+    new_format_times = time_fixer_4_fk(times)
+    dims = ('time', 'distance')
+    patch = dc.Patch(data=filtered, coords=dict(time=[np.datetime64(i) for i in new_format_times], distance=x), dims=dims)
+    filt_cutoffs = np.array([0, 400, 8000, np.inf])
+
+    fk_filtered = patch.slope_filter(filt=filt_cutoffs)
+    fk_filtered_data = np.array(fk_filtered.data)
+
+
     #normalize
-    data_normed_filtered = chan_norm(filtered)
+    data_normed_filtered = chan_norm(fk_filtered_data)
 
     if file[-9:-7] != '00':
         time_start = times[0] - datetime.timedelta(seconds=times[0].second, microseconds=times[0].microsecond)
@@ -87,14 +101,25 @@ def preprocessing_step(file):
     # this_time = np.arange(0,int(fs*60))* 500 + this_time[0]
     # print(this_time)
 
-    filled_data = np.zeros((int(fs*60),data_normed_filtered.shape[0]))
+    filled_data = np.zeros((int(fs*60),data_normed_filtered.shape[1]))
     filled_times = np.zeros((int(fs*60)), dtype=object)
 
 
 
+
+    if data_locator[0]==0:
+        filled_data[data_locator] = data_normed_filtered
+
+    else:
+        first_filler = np.array([data_normed_filtered[0,:]]*data_locator[0])
+        filled_data[:first_filler.shape[0],:] = first_filler
+
+    filt_filled_data = filled_data
+
     filled_times[data_locator] = times
-    filled_data[data_locator] = data_normed_filtered.T
-    filt_filled_data = filled_data[:,:]
+    # filled_data[data_locator] = data_normed_filtered.T
+
+    # filt_filled_data = filled_data
 
     ## Downsample 
     filled_times = filled_times[::downsample_rate]
@@ -105,49 +130,6 @@ def preprocessing_step(file):
 
     return filt_filled_data, filled_times, new_dict
 
-def preprocessing_step_single_channel(file, channel=100):
-
-    # Load data #
-    f = h5py.File(file)
-    attrs = f['Acquisition'].attrs
-    data = f['Acquisition']['Raw[0]']['RawData'][:]
-    this_time = f['Acquisition']['Raw[0]']['RawDataTime'][:]
-    times = sintela_to_datetime(this_time)
-    x = np.linspace(0,data.shape[1],data.shape[1]) * attrs['SpatialSamplingInterval']
-    data = data[:,channel]
-
-    fs = attrs['PulseRate'] #sample rate
-
-    #filter
-    sos = signal.butter(10, 2, 'hp', fs=fs, output='sos')
-    filtered = signal.sosfiltfilt(sos, data, axis=0)
-    
-    data_normed = chan_norm(filtered)
-
-    if file[-9:-7] != '00':
-        time_start = times[0] - datetime.timedelta(seconds=times[0].second, microseconds=times[0].microsecond)
-        forward_step = np.arange(time_start, times[0], 500).shape[0]
-        data_locator = np.array([int(i) for i in (this_time-this_time[0])/500]) + forward_step -1
-    else:
-        time_start = times[0]
-        data_locator = np.array([int(i) for i in (this_time-this_time[0])/500])
-
-
-
-    # this_time = np.arange(0,int(fs*60))* 500 + this_time[0]
-    # print(this_time)
-
-
-    filled_data = np.zeros((int(fs*60),))
-    filled_times = time_start + (np.arange(0,120000,1) * datetime.timedelta(microseconds=500))
-
-
-    filled_times[data_locator] = times
-    filled_data[data_locator] = filtered
-    filt_filled_data = filled_data[:, ::5] #take every 5th channel
-
-    return filt_filled_data, filled_times, attrs
-
 def foo(a, b):
     t = mdates.num2date(a)
     ms = str(t.microsecond)[:1]
@@ -155,10 +137,10 @@ def foo(a, b):
     return res
 
 def chan_norm(das_data):
-    data_normed = (das_data - np.mean(das_data, axis=0))/np.std(das_data, axis=0)
-    data_normed_all_axis = (data_normed.T - np.mean(data_normed, axis=1))/np.std(data_normed, axis=1).T    
- 
-    return data_normed_all_axis
+    data_normed = (das_data - np.mean(das_data, axis=0))/np.std(das_data, axis=0).T
+    # data_normed_all_axis = (data_normed.T - np.mean(data_normed, axis=1))/np.std(data_normed, axis=1)   
+
+    return data_normed
 
 class DataStats:
     def __init__(self, data, attrs, times):
@@ -216,7 +198,49 @@ def parallel_event_finding(dummy):
         trigger_times_list_datetime.append(times_all[trigs_samp_time])
     return {str(channel): trigger_times_list_datetime}
 
+
+def time_fixer_4_fk(times):
+    times_copy = times.copy()
+    new_format_times = []
+    for i in times_copy:
+        if round(i.microsecond/500)*500 == 1000000:
+            microsecond = 0
+            second = i.second + 1
+            minute = i.minute
+            hour = i.hour
+            day = i.day
+            if second == 60:
+                second = 0
+                minute = minute+1
+
+            if minute == 60:
+                minute = 0
+                hour=hour+1
+            
+            if hour == 24:
+                hour = 0
+                day = day+1
+            
+        else:
+            microsecond = int(round(i.microsecond/500)*500)
+            second = i.second
+            minute = i.minute
+            hour = i.hour
+            day = i.day
+
+        new_format_times.append(datetime.datetime(year=i.year,
+                                                month=i.month,
+                                                day=day,
+                                                hour=hour,
+                                                minute=minute,
+                                                second=second,
+                                                microsecond=microsecond))
+    return new_format_times
+
+
 import pathlib
+
+
 
 import pandas as pd
 from obspy import UTCDateTime
@@ -240,15 +264,16 @@ files_list = sorted(glob('/1-fnp/petasaur/p-jbod1/antarctica2425/incoming/Eastwi
 
 trigger_on = 3.5
 trigger_off = 1.2
-all_trigger_times = [[] for p in range(351)]
+all_trigger_times = [[] for holder in range(int(351 / 5))]
 
 for i in tqdm(range(len(files_list))):
 
     if files_list[i][-9:-7] != '00' or i == 0:
         try:
             filt_filled_data, times, attrs = preprocessing_step(files_list[i])
-
-        except: 
+        except Exception as e: 
+            print(e)
+            
             continue
         
 
@@ -257,7 +282,8 @@ for i in tqdm(range(len(files_list))):
         times_first = copy.deepcopy(times)
         try:
             filt_filled_data, times, attrs = preprocessing_step(files_list[i])
-        except:
+        except Exception as e: 
+            print(e)
             continue
         
         # overlap_data[:,:] = filt_filled_data
@@ -265,10 +291,16 @@ for i in tqdm(range(len(files_list))):
         all_data = np.concatenate((first,filt_filled_data), axis=0)
         times_all = np.concatenate((times_first,times), axis=0)
 
+        # fig,ax = plt.subplots()
+        # ax.plot(all_data[:,30])
+
+        # fig,ax = plt.subplots()
+        # ax.imshow(all_data, aspect='auto', vmin=-1, vmax=1)
+
         input_data_dict = {str(i):all_data[:,i] for i in range(all_data.shape[1])}
 
         new_iterable = [[times_all,dict(attrs),i,input_data_dict[i]] for i in input_data_dict]
-        
+
         with Pool(48) as p:
             picks = p.map(parallel_event_finding,new_iterable)
         for n,e in enumerate(picks):
