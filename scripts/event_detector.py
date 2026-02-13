@@ -65,29 +65,7 @@ def preprocessing_step(file):
     this_time = f['Acquisition']['Raw[0]']['RawDataTime'][:]
     times = sintela_to_datetime(this_time)
     x = np.linspace(0,data.shape[1],data.shape[1]) * attrs['SpatialSamplingInterval']
-
-
     fs = attrs['PulseRate'] #sample rate
-    bp_top = 200
-    bp_bottom = 1
-    downsample_rate = int(fs/bp_top)
-
-    #filter by freq
-    sos = signal.butter(10, [bp_bottom,bp_top], 'bp', fs=fs, output='sos')
-    filtered = signal.sosfiltfilt(sos, data, axis=0)
-
-    #FK filter
-    new_format_times = time_fixer_4_fk(times)
-    dims = ('time', 'distance')
-    patch = dc.Patch(data=filtered, coords=dict(time=[np.datetime64(i) for i in new_format_times], distance=x), dims=dims)
-    filt_cutoffs = np.array([0, 400, 8000, np.inf])
-
-    fk_filtered = patch.slope_filter(filt=filt_cutoffs)
-    fk_filtered_data = np.array(fk_filtered.data)
-
-
-    #normalize
-    data_normed_filtered = chan_norm(fk_filtered_data)
 
     if file[-9:-7] != '00':
         time_start = times[0] - datetime.timedelta(seconds=times[0].second, microseconds=times[0].microsecond)
@@ -96,39 +74,61 @@ def preprocessing_step(file):
     else:
         data_locator = np.array([int(i) for i in (this_time-this_time[0])/500])
 
+    filled_data = np.zeros((int(fs*60),data.shape[1]))
+    filled_data[:] = np.nan
 
 
-    # this_time = np.arange(0,int(fs*60))* 500 + this_time[0]
-    # print(this_time)
+    bp_top = 500
+    bp_bottom = 2
+    downsample_rate = int(fs/bp_top)
 
-    filled_data = np.zeros((int(fs*60),data_normed_filtered.shape[1]))
-    filled_times = np.zeros((int(fs*60)), dtype=object)
+    #filter by freq
+    sos = signal.butter(10, [bp_bottom,bp_top], 'bp', fs=fs, output='sos')
+    filtered = signal.sosfiltfilt(sos, data, axis=0)
 
-
-
+    #normalize
+    normed_filtered = chan_norm(filtered)
 
     if data_locator[0]==0:
-        filled_data[data_locator] = data_normed_filtered
+        filled_data[data_locator] = filtered
 
     else:
-        first_filler = np.array([data_normed_filtered[0,:]]*data_locator[0])
+        first_filler = np.array([normed_filtered[0,:]]*data_locator[0])
         filled_data[:first_filler.shape[0],:] = first_filler
 
-    filt_filled_data = filled_data
+    mean_of_chans = np.nanmean(filled_data, axis=0)
+    idx = np.where(np.isnan(filled_data))
+    filled_data[idx] = np.take(mean_of_chans, idx[1])
 
-    filled_times[data_locator] = times
-    # filled_data[data_locator] = data_normed_filtered.T
+    #FK filter
+    ## rescale the times to the filled data
+    if len(this_time) != int(fs*60):
+        this_time = np.arange(this_time[0],int(this_time[0]+(500*fs*60)), 500)
+    filled_times = sintela_to_datetime(this_time)
+    new_format_times = time_fixer_4_fk(filled_times)
 
-    # filt_filled_data = filled_data
+    dims = ('time', 'distance')
+    patch = dc.Patch(data=filled_data, coords=dict(time=[np.datetime64(i) for i in new_format_times], distance=x), dims=dims)
+    filt_cutoffs = np.array([500, 1500, 7000, 20000])
+
+    fk_filtered = patch.slope_filter(filt=filt_cutoffs)
+    fk_filtered_data = np.array(fk_filtered.data)
+
+    new_attrs = dict(attrs)
+
+    if new_attrs['MeasurementStartTime'].decode('UTF-8')[17:19] == '00' and data.shape[0] != int(new_attrs['PulseRate']*60):
+        new_attrs['Status'] = 'Corrupted'
+    else:
+        new_attrs['Status'] = 'Good'
 
     ## Downsample 
     filled_times = filled_times[::downsample_rate]
-    filt_filled_data = filt_filled_data[::downsample_rate,::5] #Skip every 5th channel
-    new_dict = dict(attrs)
-    new_dict['PulseRate'] = new_dict['PulseRate']/downsample_rate
+    filt_filled_data = fk_filtered_data[::downsample_rate,:]
+
+    new_attrs['PulseRate'] = new_attrs['PulseRate']/downsample_rate
 
 
-    return filt_filled_data, filled_times, new_dict
+    return filt_filled_data, filled_times, new_attrs
 
 def foo(a, b):
     t = mdates.num2date(a)
@@ -264,26 +264,35 @@ files_list = sorted(glob('/1-fnp/petasaur/p-jbod1/antarctica2425/incoming/Eastwi
 
 trigger_on = 3.5
 trigger_off = 1.2
-all_trigger_times = [[] for holder in range(int(351 / 5))]
+all_trigger_times = [[] for holder in range(int(351))]
+
+current_status = 'Good'
 
 for i in tqdm(range(len(files_list))):
 
-    if files_list[i][-9:-7] != '00' or i == 0:
+
+    if files_list[i][-9:-7] != '00' or i == 0 or current_status == 'Corrupted':
+
         try:
             filt_filled_data, times, attrs = preprocessing_step(files_list[i])
+
+            current_status = attrs['Status']
+
+
         except Exception as e: 
             print(e)
-            
+            current_status = 'Corrupted'
             continue
-        
 
     else:
         first = copy.deepcopy(filt_filled_data)
         times_first = copy.deepcopy(times)
         try:
             filt_filled_data, times, attrs = preprocessing_step(files_list[i])
+            current_status = attrs['Status']
         except Exception as e: 
             print(e)
+            current_status = 'Corrupted'
             continue
         
         # overlap_data[:,:] = filt_filled_data
@@ -311,6 +320,6 @@ for i in tqdm(range(len(files_list))):
 
     # if i ==10: break
 
-with open('../auto_picked_events_all_5thChannel.pkl', 'wb') as file:
+with open('../auto_picked_events_all_chans_fk_filtered.pkl', 'wb') as file:
     # Serialize and write the data to the file
     pkl.dump(all_trigger_times, file)
